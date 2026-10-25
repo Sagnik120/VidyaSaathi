@@ -1,0 +1,23 @@
+# ==============================================================================
+# VidyaSaathi — LITE dependencies for 512 MB free hosts (Render free tier)
+# No torch / sentence-transformers / transformers / chromadb / scikit-learn.
+# Use together with: EMBEDDING_BACKEND=lexical  VIDEO_MODE=lite
+# ==============================================================================
+fastapi>=0.121.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.5.0
+sqlalchemy>=2.0.30
+bcrypt>=4.1.0
+pyjwt>=2.8.0
+email-validator>=2.1.0
+pypdf>=3.17.0
+pdfplumber>=0.10.0
+python-docx>=1.0.0
+python-pptx>=0.6.21
+langdetect>=1.0.9
+httpx>=0.27.0
+edge-tts>=6.1.9
+imageio-ffmpeg>=0.4.9
+pillow>=10.0.0
+matplotlib>=3.8.0

@@ -1,0 +1,3 @@
+ffmpeg
+libfribidi0
+libraqm0
