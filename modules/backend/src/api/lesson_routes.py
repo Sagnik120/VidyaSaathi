@@ -1,0 +1,624 @@
+"""Lessons: creation from topic or document, planning, history, media, analytics."""
+import asyncio
+import functools
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Literal, Optional
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from modules.backend.src.config import settings
+from modules.backend.src.db.base import get_db
+from modules.backend.src.db.models import Document, Lesson, User, utcnow
+from modules.backend.src.deps import get_current_user
+from modules.backend.src.services import lesson_service
+from modules.backend.src.services.session_manager import session_manager
+from modules.backend.src.security import create_ws_ticket
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/lessons", tags=["lessons"])
+
+
+class CreateLessonRequest(BaseModel):
+    topic: Optional[str] = Field(default=None, max_length=500)
+    document_id: Optional[str] = None
+    level: Literal["beginner", "intermediate", "advanced"] = "beginner"
+    language: str = Field(default="en", max_length=10)
+    time_budget_min: int = Field(default=15, ge=5, le=120)
+    style: Optional[str] = Field(default=None, max_length=40)
+    skill_concept_id: Optional[str] = Field(default=None, max_length=80)
+    skill_goal_id: Optional[str] = Field(default=None, max_length=80)
+    syllabus_topic_id: Optional[str] = Field(default=None, max_length=160)
+
+
+def _skill_tags(payload: CreateLessonRequest) -> dict:
+    from modules.backend.src.services import skill_map
+
+    graph = skill_map.concepts()
+    concept = payload.skill_concept_id if payload.skill_concept_id in graph else None
+    goal = payload.skill_goal_id if skill_map.valid_goal(payload.skill_goal_id, graph) else None
+    return {"skill_concept_id": concept, "skill_goal_id": goal if concept else None}
+
+
+def _owned_lesson(db: Session, lesson_id: str, user: User) -> Lesson:
+    lesson = db.get(Lesson, lesson_id)
+    if not lesson or lesson.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Lesson not found.")
+    return lesson
+
+
+def _owned_document(db: Session, document_id: str, user: User) -> Document:
+    doc = db.get(Document, document_id)
+    if not doc or doc.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return doc
+
+
+# --------------------------------------------------------------------------
+# Documents
+# --------------------------------------------------------------------------
+
+@router.post("/documents", status_code=status.HTTP_201_CREATED)
+async def upload_document(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Store an uploaded study file and ingest it into the RAG index."""
+    filename = os.path.basename(file.filename or "document")
+    ext = Path(filename).suffix.lower()
+    if ext not in settings.allowed_upload_ext:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Allowed: "
+            + ", ".join(settings.allowed_upload_ext),
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=422, detail="The uploaded file is empty.")
+    if len(file_bytes) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is larger than {settings.max_upload_bytes // (1024 * 1024)} MB.",
+        )
+
+    doc = Document(
+        user_id=user.id,
+        filename=filename,
+        mime_type=file.content_type or "application/octet-stream",
+        file_path="",
+        size_bytes=len(file_bytes),
+        status="ingesting",
+    )
+    db.add(doc)
+    db.flush()
+
+    # Scope uploads per user so one account can never read another's file.
+    user_dir = settings.upload_root / user.id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    dest = user_dir / f"{doc.id}{ext}"
+    dest.write_bytes(file_bytes)
+    doc.file_path = str(dest)
+    db.flush()
+
+    from modules.backend.src.integrations.container import services
+
+    rag_service = services["rag_service"]
+    try:
+        # Parsing, loading the embedding model and embedding every chunk are all
+        # blocking CPU work. Called directly from this async endpoint they block
+        # the event loop, which on a single-worker deploy freezes every other
+        # request, the classroom WebSockets and the host's health check — long
+        # enough on a first upload (model load) for the platform to restart the
+        # container mid-lesson. Hand it to the executor instead.
+        parsed = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                rag_service.ingest_document,
+                file_bytes=file_bytes,
+                filename=filename,
+                mime_type=doc.mime_type,
+                document_id=doc.id,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Ingestion failed for document %s", doc.id)
+        doc.status = "failed"
+        doc.error = str(exc)[:1000]
+        db.flush()
+        raise HTTPException(
+            status_code=422,
+            detail=f"We couldn't read that file: {exc}",
+        ) from exc
+
+    # A document indexed with hash-fallback vectors can never ground a lesson,
+    # so it is reported as failed rather than sitting in the library looking
+    # usable. The retrieval guard already refuses to cite it either way.
+    if getattr(getattr(rag_service, "embedding_adapter", None), "is_degraded", False):
+        doc.status = "failed"
+        doc.error = (
+            "The embedding model is unavailable on this server, so this document "
+            "could not be indexed for search. Please try again later."
+        )
+        db.flush()
+        raise HTTPException(status_code=503, detail=doc.error)
+
+    structure = getattr(parsed, "detected_structure", None)
+    doc.status = "ready"
+    doc.source_lang = getattr(parsed, "source_lang", None)
+    doc.chunk_count = len(getattr(parsed, "chunks", []) or [])
+    doc.chapters = list(getattr(structure, "chapters", []) or [])
+    doc.key_terms = list(getattr(structure, "key_terms", []) or [])
+    db.flush()
+
+    return {
+        "document_id": doc.id,
+        "filename": doc.filename,
+        "size_bytes": doc.size_bytes,
+        "status": doc.status,
+        "source_lang": doc.source_lang,
+        "chunk_count": doc.chunk_count,
+        "chapters": doc.chapters,
+        "key_terms": doc.key_terms,
+    }
+
+
+@router.get("/documents")
+def list_documents(user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")):
+    docs = db.scalars(
+        select(Document).where(Document.user_id == user.id).order_by(Document.created_at.desc())
+    ).all()
+    return [
+        {
+            "document_id": d.id,
+            "filename": d.filename,
+            "size_bytes": d.size_bytes,
+            "status": d.status,
+            "chapters": d.chapters,
+            "key_terms": d.key_terms,
+            "chunk_count": d.chunk_count,
+            "created_at": d.created_at.isoformat(),
+        }
+        for d in docs
+    ]
+
+
+@router.delete("/documents/{document_id}")
+def delete_document(
+    document_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")
+):
+    doc = _owned_document(db, document_id, user)
+    try:
+        Path(doc.file_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+    db.delete(doc)
+    db.flush()
+    return {"status": "ok", "message": "Document deleted."}
+
+
+# --------------------------------------------------------------------------
+# Lessons
+# --------------------------------------------------------------------------
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+def create_lesson(
+    payload: CreateLessonRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Create a lesson from a topic or an already-ingested document."""
+    topic = (payload.topic or "").strip()
+    if not topic and not payload.document_id:
+        raise HTTPException(
+            status_code=422, detail="Provide a topic or choose an uploaded document."
+        )
+
+    document = None
+    if payload.document_id:
+        document = _owned_document(db, payload.document_id, user)
+        if document.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail=f"That document is not ready yet (status: {document.status}).",
+            )
+
+    lesson = Lesson(
+        user_id=user.id,
+        title=topic or (document.filename if document else "Lesson"),
+        source="document" if document else "topic",
+        topic=topic or None,
+        document_id=document.id if document else None,
+        level=payload.level,
+        language=payload.language,
+        time_budget_min=payload.time_budget_min,
+        style=payload.style,
+        status="created",
+        # Unknown ids are dropped rather than rejected: the lesson still works.
+        **_skill_tags(payload),
+    )
+    from modules.backend.src.services import difficulty
+
+    lesson.difficulty = difficulty.starting_level(db, user, payload.level)
+    from modules.backend.src.services import curriculum
+
+    if curriculum.find_topic(payload.syllabus_topic_id):
+        lesson.syllabus_topic_id = payload.syllabus_topic_id
+    db.add(lesson)
+    db.flush()
+    if lesson.syllabus_topic_id:
+        curriculum.start_topic(db, user, lesson.syllabus_topic_id, lesson.id)
+    lesson_service.log_event(db, lesson, "lesson_created")
+
+    return {"lesson_id": lesson.id, "status": lesson.status, "title": lesson.title}
+
+
+@router.post("/{lesson_id}/plan")
+def generate_plan(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Run UNDERSTAND + PLAN and persist the resulting curriculum."""
+    lesson = _owned_lesson(db, lesson_id, user)
+
+    if lesson.plan_json and lesson.status not in ("created",):
+        return {"lesson_id": lesson.id, "plan": lesson.plan_json, "regenerated": False}
+
+    try:
+        plan = session_manager.build_plan(lesson, db)
+    except Exception as exc:
+        logger.exception("Planning failed for lesson %s", lesson.id)
+        raise HTTPException(
+            status_code=502, detail=f"The lesson planner could not build a plan: {exc}"
+        ) from exc
+
+    lesson_service.persist_plan(db, lesson, plan)
+    db.flush()
+
+    return {
+        "lesson_id": lesson.id,
+        "plan": lesson.plan_json,
+        "regenerated": True,
+        "detail": lesson_service.lesson_detail(db, lesson),
+    }
+
+
+@router.post("/{lesson_id}/ticket")
+def issue_ws_ticket(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Mint a short-lived ticket for the live classroom WebSocket.
+
+    Access tokens never go in a URL, because URLs leak via logs and Referer.
+    """
+    lesson = _owned_lesson(db, lesson_id, user)
+    if not lesson.plan_json:
+        raise HTTPException(status_code=409, detail="Generate the lesson plan first.")
+    return {
+        "ticket": create_ws_ticket(user.id, lesson.id),
+        "expires_in": settings.ws_ticket_ttl_sec,
+        "ws_path": f"{settings.api_v1_str}/lessons/{lesson.id}/live",
+    }
+
+
+@router.get("")
+def list_lessons(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    search: Optional[str] = Query(default=None, max_length=200),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    query = select(Lesson).where(Lesson.user_id == user.id)
+    if status_filter and status_filter != "all":
+        query = query.where(Lesson.status == status_filter)
+    if search:
+        query = query.where(Lesson.title.ilike(f"%{search.strip()}%"))
+
+    total = db.scalar(
+        select(func.count()).select_from(query.subquery())
+    ) or 0
+    rows = db.scalars(
+        query.order_by(Lesson.updated_at.desc()).limit(limit).offset(offset)
+    ).all()
+
+    return {
+        "lessons": [lesson_service.lesson_summary(db, lesson) for lesson in rows],
+        "count": len(rows),
+        "total": total,
+        "offset": offset,
+        "has_more": offset + len(rows) < total,
+    }
+
+
+@router.get("/{lesson_id}")
+def get_lesson(
+    lesson_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")
+):
+    lesson = _owned_lesson(db, lesson_id, user)
+    return lesson_service.lesson_detail(db, lesson)
+
+
+@router.delete("/{lesson_id}")
+def delete_lesson(
+    lesson_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db, scope="function")
+):
+    lesson = _owned_lesson(db, lesson_id, user)
+    media_dir = settings.media_root / lesson.id
+    db.delete(lesson)
+    db.flush()
+    try:
+        if media_dir.exists():
+            for child in media_dir.iterdir():
+                child.unlink(missing_ok=True)
+            media_dir.rmdir()
+    except OSError:
+        pass
+    lesson_service.refresh_learner_profile(db, user.id)
+    return {"status": "ok", "message": "Lesson deleted."}
+
+
+# --------------------------------------------------------------------------
+# Media — served only to the lesson's owner, never by arbitrary path
+# --------------------------------------------------------------------------
+
+def _serve_owned_media(stored_path: Optional[str], lesson_id: str, media_type: str) -> FileResponse:
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="No media for this node yet.")
+
+    path = Path(stored_path).resolve()
+    root = settings.media_root.resolve()
+    # Containment check: a stored path must live under this lesson's media dir.
+    try:
+        path.relative_to(root / lesson_id)
+    except ValueError:
+        logger.error("Blocked out-of-root media access: %s", path)
+        raise HTTPException(status_code=404, detail="Media not found.")
+
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Media file is no longer available.")
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@router.get("/{lesson_id}/why")
+def get_lesson_why(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Every adaptive decision in this lesson, as structured entries for the "Why?" log."""
+    from modules.backend.src.services import why_log
+
+    lesson = _owned_lesson(db, lesson_id, user)
+    return {"lesson_id": lesson.id, "entries": why_log.build(db, lesson)}
+
+
+@router.get("/{lesson_id}/trace")
+def get_lesson_trace(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Structured agent-decision trace for this lesson (observable metadata only)."""
+    lesson = _owned_lesson(db, lesson_id, user)
+    return {"lesson_id": lesson.id, "events": lesson_service.agent_trace(db, lesson)}
+
+
+@router.get("/{lesson_id}/notes")
+def get_lesson_notes(
+    lesson_id: str,
+    format: Literal["json", "markdown"] = Query("json"),
+    download: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """The lesson's chapter notes — as JSON for the UI, or a Markdown study sheet."""
+    lesson = _owned_lesson(db, lesson_id, user)
+
+    if format == "markdown":
+        markdown = lesson_service.lesson_notes_markdown(db, lesson)
+        headers = {}
+        if download:
+            safe = "".join(
+                ch if ch.isalnum() or ch in " -_" else "" for ch in (lesson.title or "lesson")
+            ).strip() or "lesson"
+            headers["Content-Disposition"] = f'attachment; filename="{safe[:80]} - notes.md"'
+        return Response(
+            content=markdown, media_type="text/markdown; charset=utf-8", headers=headers
+        )
+
+    nodes = sorted(lesson.nodes, key=lambda n: n.position)
+    return {
+        "lesson_id": lesson.id,
+        "title": lesson.title,
+        "notes": [
+            {
+                "node_id": n.node_id,
+                "concept": n.concept,
+                "depth": n.depth,
+                "est_minutes": n.est_minutes,
+                "status": n.status,
+                "key_points": (n.notes_json or {}).get("key_points") or [],
+                "example": (n.notes_json or {}).get("example"),
+                "script_text": n.script_text,
+                "citation": n.citation_json,
+            }
+            for n in nodes
+            if n.script_text or n.notes_json
+        ],
+    }
+
+
+@router.get("/{lesson_id}/nodes/{node_id}/video")
+def get_node_video(
+    lesson_id: str,
+    node_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    lesson = _owned_lesson(db, lesson_id, user)
+    node = lesson_service.get_node(db, lesson, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found.")
+    return _serve_owned_media(node.video_path, lesson.id, "video/mp4")
+
+
+@router.get("/{lesson_id}/nodes/{node_id}/captions")
+def get_node_captions(
+    lesson_id: str,
+    node_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    lesson = _owned_lesson(db, lesson_id, user)
+    node = lesson_service.get_node(db, lesson, node_id)
+    if not node or not node.captions_url:
+        raise HTTPException(status_code=404, detail="No captions for this node.")
+    caption_path = settings.media_root / lesson.id
+    matches = list(caption_path.glob(f"{node_id}_*.vtt"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Captions file is no longer available.")
+    # A re-explained node leaves older caption files behind; serve the latest.
+    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    return _serve_owned_media(str(latest), lesson.id, "text/vtt")
+
+
+# --------------------------------------------------------------------------
+# Paused lessons, "learn this again", and practice
+# --------------------------------------------------------------------------
+
+async def _quiesced_lesson(db: Session, lesson_id: str, user: User) -> Lesson:
+    """Stop any live classroom on the lesson (it saves its step first), then
+    load the lesson fresh — so this action never races a running lesson."""
+    from modules.backend.src.api.ws import stop_active
+
+    _owned_lesson(db, lesson_id, user)
+    await stop_active(lesson_id)
+    db.rollback()  # start a fresh read: see everything the classroom saved
+    return _owned_lesson(db, lesson_id, user)
+
+
+def _lesson_action(db: Session, lesson: Lesson, action) -> dict:
+    from modules.backend.src.services.escalation_service import EscalationError
+
+    try:
+        action()
+    except EscalationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.flush()
+    session_manager.reset(lesson.id)  # rebuilt from the database on next connect
+    return lesson_service.lesson_detail(db, lesson)
+
+
+@router.post("/{lesson_id}/continue")
+async def continue_paused_lesson(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Paused for a mentor -> re-teach the stuck concept, fresh count."""
+    from modules.backend.src.services import escalation_service
+
+    lesson = await _quiesced_lesson(db, lesson_id, user)
+    return _lesson_action(db, lesson, lambda: escalation_service.continue_lesson(db, lesson))
+
+
+@router.post("/{lesson_id}/skip")
+async def skip_paused_concept(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Paused for a mentor -> move past the stuck concept (marked for review)."""
+    from modules.backend.src.services import escalation_service
+
+    lesson = await _quiesced_lesson(db, lesson_id, user)
+    return _lesson_action(db, lesson, lambda: escalation_service.skip_concept(db, lesson))
+
+
+@router.post("/{lesson_id}/nodes/{node_id}/relearn")
+async def relearn_concept(
+    lesson_id: str,
+    node_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Re-teach one skipped concept, then return to where the lesson was."""
+    from modules.backend.src.services import escalation_service
+
+    lesson = await _quiesced_lesson(db, lesson_id, user)
+    return _lesson_action(db, lesson, lambda: escalation_service.relearn_concept(db, lesson, node_id))
+
+
+class PracticeAnswer(BaseModel):
+    answer: str = Field(min_length=1, max_length=4000)
+
+
+@router.get("/{lesson_id}/practice")
+def practice_questions(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """The lesson's questions for revision. Never changes the lesson."""
+    from modules.backend.src.services import practice_service
+
+    lesson = _owned_lesson(db, lesson_id, user)
+    return {"lesson_id": lesson.id, "title": lesson.title,
+            "questions": practice_service.practice_set(db, lesson, user.id)}
+
+
+@router.post("/{lesson_id}/practice/generate")
+def generate_practice(
+    lesson_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    """Practice Lab: fresh questions for this lesson's weakest concepts."""
+    from modules.backend.src.services import practice_service
+
+    lesson = _owned_lesson(db, lesson_id, user)
+    try:
+        practice_service.generate(db, lesson)
+    except practice_service.PracticeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    db.commit()
+    return {"lesson_id": lesson.id, "title": lesson.title,
+            "questions": practice_service.practice_set(db, lesson, user.id)}
+
+
+@router.post("/{lesson_id}/practice/{interaction_id}")
+def answer_practice_question(
+    lesson_id: str,
+    interaction_id: str,
+    payload: PracticeAnswer,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db, scope="function"),
+):
+    from modules.backend.src.services import practice_service
+
+    lesson = _owned_lesson(db, lesson_id, user)
+    try:
+        return practice_service.grade(db, lesson, user.id, interaction_id, payload.answer)
+    except practice_service.PracticeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
